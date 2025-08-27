@@ -1,0 +1,16 @@
+LIMIT_BAL
+AGE
+EDUCATION
+MARRIAGE
+avg_pay_amt
+avg_bill_amt
+repay_ratio_avg
+cur_recent
+paydown_ratio
+mpr
+pay_status_current
+pay_status_avg
+pay_status_ema
+pay_is_delinquent
+pay_severity
+MONTHS

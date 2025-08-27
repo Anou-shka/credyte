@@ -1,0 +1,20 @@
+{
+  "model": "best",
+  "n_rows": 29163,
+  "n_features": 16,
+  "bg_size": 512,
+  "force_n": 10,
+  "outdir": "images/shap",
+  "feature_sample": [
+    "LIMIT_BAL",
+    "AGE",
+    "EDUCATION",
+    "MARRIAGE",
+    "avg_pay_amt",
+    "avg_bill_amt",
+    "repay_ratio_avg",
+    "cur_recent",
+    "paydown_ratio",
+    "mpr"
+  ]
+}

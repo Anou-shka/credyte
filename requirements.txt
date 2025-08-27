@@ -1,0 +1,23 @@
+# Core scientific stack
+numpy
+pandas
+scikit-learn
+
+# Imbalanced learning
+imblearn
+
+# Gradient boosting models
+xgboost
+lightgbm
+
+# Model explainability
+shap
+matplotlib
+seaborn
+
+# App framework
+streamlit
+
+# Serialization
+joblib
+

@@ -1,0 +1,69 @@
+{
+  "data": {
+    "n_train": 23330,
+    "n_test": 5833,
+    "n_features": 16,
+    "features": [
+      "LIMIT_BAL",
+      "AGE",
+      "EDUCATION",
+      "MARRIAGE",
+      "avg_pay_amt",
+      "avg_bill_amt",
+      "repay_ratio_avg",
+      "cur_recent",
+      "paydown_ratio",
+      "mpr",
+      "pay_status_current",
+      "pay_status_avg",
+      "pay_status_ema",
+      "pay_is_delinquent",
+      "pay_severity",
+      "MONTHS"
+    ]
+  },
+  "baseline_lr": {
+    "train": {
+      "roc_auc": 0.7593331169129854,
+      "pr_auc": 0.5268489016465063,
+      "brier": 0.1886974244945095,
+      "log_loss": 0.5731551704914173
+    },
+    "test": {
+      "roc_auc": 0.7578016599492765,
+      "pr_auc": 0.5343406433852161,
+      "brier": 0.18688033127312553,
+      "log_loss": 0.5673503328675766
+    }
+  },
+  "xgboost": {
+    "train": {
+      "roc_auc": 0.8638742966140108,
+      "pr_auc": 0.6794103314229382,
+      "brier": 0.15202876303553015,
+      "log_loss": 0.47391170993127
+    },
+    "test": {
+      "roc_auc": 0.77142728869869,
+      "pr_auc": 0.5603005562749844,
+      "brier": 0.1737444781889268,
+      "log_loss": 0.528692098154159
+    }
+  },
+  "lightgbm": null,
+  "best": {
+    "name": "xgboost",
+    "test": {
+      "roc_auc": 0.77142728869869,
+      "pr_auc": 0.5603005562749844,
+      "brier": 0.1737444781889268,
+      "log_loss": 0.528692098154159
+    }
+  },
+  "params": {
+    "seed": 42,
+    "test_size": 0.2,
+    "months": 6,
+    "halflife": 3
+  }
+}
