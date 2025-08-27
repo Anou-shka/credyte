@@ -35,7 +35,7 @@ Built with **Streamlit**, it combines calibrated ML models, financial ratio engi
 
 2. Install dependencies:
 
-   ```bash
+    ```bash
    pip install -r requirements.txt
    ```
 
@@ -79,7 +79,7 @@ Built with **Streamlit**, it combines calibrated ML models, financial ratio engi
 
 ### 🔮 Prediction
 
-![Prediction Screenshot](images/Prediction.png)
+![Prediction Screenshot](images/Predictions.png)
 
 ### 📊 Ratios
 
