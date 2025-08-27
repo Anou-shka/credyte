@@ -100,8 +100,6 @@ Built with **Streamlit**, it combines calibrated ML models, financial ratio engi
 * [Matplotlib](https://matplotlib.org/)
 ---
 
----
-
 ## 📜 License
 
 MIT License © 2025 \Anoushka Nahata
