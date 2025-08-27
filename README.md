@@ -31,7 +31,7 @@ Built with **Streamlit**, it combines calibrated ML models, financial ratio engi
    ```bash
    git clone https://github.com/yourusername/credyte.git
    cd credyte
-````
+```
 
 2. Install dependencies:
 
@@ -79,7 +79,7 @@ Built with **Streamlit**, it combines calibrated ML models, financial ratio engi
 
 ### 🔮 Prediction
 
-![Prediction Screenshot](images/prediction.png)
+![Prediction Screenshot](images/Prediction.png)
 
 ### 📊 Ratios
 
