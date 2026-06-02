@@ -51,14 +51,61 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 /* Hero */
 .hero {
-  background: linear-gradient(135deg, rgba(99,102,241,.12) 0%, rgba(139,92,246,.08) 100%);
-  border: 1px solid rgba(99,102,241,.25);
-  border-radius: 16px;
-  padding: 28px 32px;
+  background: linear-gradient(135deg, rgba(99,102,241,.14) 0%, rgba(139,92,246,.10) 60%, rgba(16,185,129,.06) 100%);
+  border: 1px solid rgba(99,102,241,.30);
+  border-radius: 20px;
+  padding: 32px 36px;
   margin-bottom: 1.5rem;
+  position: relative;
+  overflow: hidden;
 }
-.hero h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -.5px; }
-.hero p  { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -40px; right: -40px;
+  width: 180px; height: 180px;
+  background: radial-gradient(circle, rgba(99,102,241,.18) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero-icon {
+  font-size: 36px;
+  line-height: 1;
+  margin-bottom: 8px;
+  display: block;
+}
+.hero h1 {
+  margin: 0;
+  font-size: 32px;
+  font-weight: 800;
+  letter-spacing: -.8px;
+  background: linear-gradient(90deg, #e2e8f0 0%, #a5b4fc 60%, #c4b5fd 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.hero-sub {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 14.5px;
+  line-height: 1.6;
+  max-width: 560px;
+}
+.hero-pills {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.hero-pill {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(99,102,241,.12);
+  border: 1px solid rgba(99,102,241,.25);
+  color: #a5b4fc;
+  letter-spacing: .04em;
+}
 
 /* Section header */
 .section-header {
@@ -228,37 +275,46 @@ def render_gauge(proba: float, band: str) -> None:
     color_map = {"Low": "#10b981", "Medium": "#f59e0b", "High": "#ef4444"}
     color = color_map.get(band, "#6366f1")
 
-    fig, ax = plt.subplots(figsize=(3.5, 2.0), subplot_kw={"projection": "polar"})
+    fig, ax = plt.subplots(figsize=(2.6, 1.5), subplot_kw={"projection": "polar"})
     fig.patch.set_facecolor("#161b27")
     ax.set_facecolor("#161b27")
 
-    # Background arc (grey)
-    theta_start, theta_end = np.pi, 0
-    n = 200
-    theta = np.linspace(theta_start, theta_end, n)
-    ax.plot(theta, [1]*n, color="#21293d", linewidth=18, solid_capstyle="round")
+    n = 300
+    # Background track
+    theta_bg = np.linspace(np.pi, 0, n)
+    ax.plot(theta_bg, [1]*n, color="#21293d", linewidth=14, solid_capstyle="round")
 
-    # Filled arc proportional to proba
+    # Zone colouring: low=green, med=amber, high=red
+    for zone_start, zone_end, zone_color in [
+        (np.pi,       np.pi*0.65, "#10b981"),
+        (np.pi*0.65,  np.pi*0.35, "#f59e0b"),
+        (np.pi*0.35,  0,          "#ef4444"),
+    ]:
+        zone_theta = np.linspace(zone_start, zone_end, 100)
+        ax.plot(zone_theta, [1]*100, color=zone_color, linewidth=14, alpha=0.20, solid_capstyle="butt")
+
+    # Filled arc
     fill_end = np.pi - proba * np.pi
     theta_fill = np.linspace(np.pi, fill_end, n)
-    ax.plot(theta_fill, [1]*n, color=color, linewidth=18, solid_capstyle="round")
+    ax.plot(theta_fill, [1]*n, color=color, linewidth=14, solid_capstyle="round")
 
     # Needle
     angle = np.pi - proba * np.pi
-    ax.annotate("", xy=(angle, 0.95), xytext=(angle, 0.0),
-                arrowprops=dict(arrowstyle="-|>", color="#e2e8f0", lw=2, mutation_scale=12))
+    ax.annotate("", xy=(angle, 0.88), xytext=(angle, 0.05),
+                arrowprops=dict(arrowstyle="-|>", color="#e2e8f0", lw=1.5, mutation_scale=10))
+    ax.plot([angle], [0.05], "o", color="#e2e8f0", markersize=4)
 
-    ax.set_ylim(0, 1.3)
-    ax.set_xlim(0, np.pi)
+    ax.set_ylim(0, 1.25)
     ax.axis("off")
     ax.set_thetamin(0); ax.set_thetamax(180)
 
-    ax.text(0.5, 0.22, f"{proba:.1%}", ha="center", va="center", transform=ax.transAxes,
-            fontsize=24, fontweight="bold", color=color)
-    ax.text(0.5, 0.05, band + " Risk", ha="center", va="center", transform=ax.transAxes,
-            fontsize=11, color="#8b96b4")
-    ax.text(0.07, 0.05, "0%", ha="center", transform=ax.transAxes, fontsize=9, color="#8b96b4")
-    ax.text(0.93, 0.05, "100%", ha="center", transform=ax.transAxes, fontsize=9, color="#8b96b4")
+    # Labels
+    ax.text(0.5, 0.18, f"{proba:.1%}", ha="center", va="center", transform=ax.transAxes,
+            fontsize=17, fontweight="bold", color=color)
+    ax.text(0.5, 0.02, band + " Risk", ha="center", va="center", transform=ax.transAxes,
+            fontsize=8.5, color="#8b96b4", fontweight="600")
+    ax.text(0.04, 0.00, "0%", ha="center", transform=ax.transAxes, fontsize=7, color="#4a5568")
+    ax.text(0.96, 0.00, "100%", ha="center", transform=ax.transAxes, fontsize=7, color="#4a5568")
 
     plt.tight_layout(pad=0)
     st.pyplot(fig, clear_figure=True)
@@ -376,16 +432,24 @@ def _driver_chips(shap_row: np.ndarray, schema: List[str], X_one_row: pd.Series)
         return html
 
     st.markdown('<div class="section-header">Key Risk Drivers</div>', unsafe_allow_html=True)
+    st.markdown("""
+<div style="background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.18);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#9aa6d1;line-height:1.6;">
+  <b style="color:#a5b4fc;">How to read this:</b>&nbsp;
+  These are the three features with the <b>largest SHAP values</b> for this borrower — the ones that pushed the predicted default risk highest (↑) or lowest (↓).
+  The displayed number is the <b>actual feature value</b> for this borrower, not the SHAP impact.
+  A high <em>credit utilization</em> borrower will appear on the risk side even if they paid on time, because utilization alone carries significant predictive weight.
+</div>
+""", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(
-            '<div style="font-size:12px;color:#ef4444;font-weight:600;margin-bottom:6px;">↑ Increasing Risk</div>'
+            '<div style="font-size:12px;color:#ef4444;font-weight:600;margin-bottom:6px;">↑ Pushing Risk Up</div>'
             f'<div class="driver-row">{make_cards(ups, "risk-up")}</div>',
             unsafe_allow_html=True
         )
     with col2:
         st.markdown(
-            '<div style="font-size:12px;color:#10b981;font-weight:600;margin-bottom:6px;">↓ Protective Factors</div>'
+            '<div style="font-size:12px;color:#10b981;font-weight:600;margin-bottom:6px;">↓ Pulling Risk Down</div>'
             f'<div class="driver-row">{make_cards(downs, "risk-down")}</div>',
             unsafe_allow_html=True
         )
@@ -398,8 +462,18 @@ scoring_model, scoring_tag, shap_model, shap_tag, (def_low, def_high), op_meta =
 # ---------- Header ----------
 st.markdown("""
 <div class="hero">
-  <h1>⬡ Credyte</h1>
-  <p>Credit risk analytics — calibrated probability of default, financial ratio analysis, and SHAP explainability.</p>
+  <span class="hero-icon">⬡</span>
+  <h1>Credyte</h1>
+  <p class="hero-sub">
+    Enterprise-grade credit risk analytics — predict probability of default with calibrated ML,
+    decompose every decision with SHAP, and track financial health ratios in real time.
+  </p>
+  <div class="hero-pills">
+    <span class="hero-pill">Calibrated PD Scoring</span>
+    <span class="hero-pill">SHAP Explainability</span>
+    <span class="hero-pill">Financial Ratio Engine</span>
+    <span class="hero-pill">XGBoost + Isotonic</span>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -478,21 +552,38 @@ with tabs[0]:
 
         st.markdown('<div class="section-header">Risk Assessment</div>', unsafe_allow_html=True)
 
-        gauge_col, detail_col = st.columns([1, 2])
+        gauge_col, pd_col, thresh_col = st.columns([1, 1, 2])
         with gauge_col:
             render_gauge(proba, band)
 
-        with detail_col:
+        with pd_col:
             st.markdown(f"""
-            <div class="kpi" style="margin-bottom:12px;">
+            <div class="kpi" style="height:100%;justify-content:center;">
               <div class="label">Probability of Default</div>
               <div class="value {band_css(band)}">{proba:.1%}</div>
               <span class="risk-badge {badge_css(band)}">{band} Risk</span>
             </div>
-            <div class="kpi">
-              <div class="label">Decision Threshold</div>
-              <div class="value" style="font-size:20px;color:#8b96b4;">
-                Low &lt; {low_thr:.0%} &nbsp;·&nbsp; Medium &lt; {high_thr:.0%} &nbsp;·&nbsp; High ≥ {high_thr:.0%}
+            """, unsafe_allow_html=True)
+
+        with thresh_col:
+            st.markdown(f"""
+            <div class="kpi" style="height:100%;justify-content:center;">
+              <div class="label">Risk Band Thresholds</div>
+              <div style="display:flex;gap:10px;justify-content:center;margin-top:8px;flex-wrap:wrap;">
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#10b981;font-weight:600;margin-bottom:2px;">LOW</div>
+                  <div style="font-size:18px;font-weight:700;color:#10b981;">PD &lt; {low_thr:.0%}</div>
+                </div>
+                <div style="color:#21293d;font-size:22px;padding-top:6px;">·</div>
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#f59e0b;font-weight:600;margin-bottom:2px;">MEDIUM</div>
+                  <div style="font-size:18px;font-weight:700;color:#f59e0b;">PD &lt; {high_thr:.0%}</div>
+                </div>
+                <div style="color:#21293d;font-size:22px;padding-top:6px;">·</div>
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#ef4444;font-weight:600;margin-bottom:2px;">HIGH</div>
+                  <div style="font-size:18px;font-weight:700;color:#ef4444;">PD ≥ {high_thr:.0%}</div>
+                </div>
               </div>
             </div>
             """, unsafe_allow_html=True)
@@ -526,7 +617,16 @@ with tabs[0]:
         if shap_row is not None:
             _driver_chips(shap_row, schema, X_one_shap.iloc[0])
 
-            st.markdown('<div class="section-header">Why this prediction? (SHAP Waterfall)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header">Why this prediction? — SHAP Waterfall</div>', unsafe_allow_html=True)
+            st.markdown("""
+<div style="background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.18);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#9aa6d1;line-height:1.6;">
+  <b style="color:#a5b4fc;">How SHAP works:</b>&nbsp;
+  SHAP (SHapley Additive exPlanations) decomposes the model's output into per-feature contributions, grounded in cooperative game theory.
+  The waterfall starts from the <b>baseline</b> — the average model output across all borrowers (E[f(x)]) — and each bar shows how much a single feature <b>raises</b> (red, →) or <b>lowers</b> (blue, ←) the final score.
+  The bars stack to reach <b>f(x)</b>, the raw model score for this borrower.
+  Features are sorted by impact magnitude — the top bar has the biggest influence on this specific prediction.
+</div>
+""", unsafe_allow_html=True)
             render_waterfall(explainer, shap_row, X_one_shap)
 
             with st.expander("All feature contributions (|SHAP|)"):
@@ -632,13 +732,16 @@ with tabs[2]:
         else:
             col.info(f"{caption}: not generated yet — run `python -m src.calibrate`")
 
-    st.markdown("#### Reading reliability diagrams")
     st.markdown("""
-- **X-axis** = predicted PD; **Y-axis** = observed default rate in that bin.
-- **Dashed diagonal** = perfect calibration (predicted ≈ actual).
-- Points **above** the line → model underestimates risk. Points **below** → overestimates.
-- Isotonic regression typically gives the best calibration given enough data.
-    """)
+<div style="background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.18);border-radius:10px;padding:10px 14px;margin:10px 0 14px;font-size:13px;color:#9aa6d1;line-height:1.6;">
+  <b style="color:#a5b4fc;">How to read reliability diagrams:</b>&nbsp;
+  Each plot groups borrowers into bins by predicted probability and compares the average predicted PD against the <em>actual observed default rate</em> in that bin.
+  The <b>dashed diagonal</b> is perfect calibration — predicted = observed.
+  Points <b>above</b> the line mean the model <em>underestimates</em> risk (it said 20%, but 30% defaulted).
+  Points <b>below</b> mean it <em>overestimates</em> (it said 60%, but only 40% defaulted).
+  A well-calibrated model's points hug the diagonal closely.
+</div>
+""", unsafe_allow_html=True)
 
     met_path = Path("models/calibration_metrics.json")
     if met_path.exists():
@@ -652,7 +755,39 @@ with tabs[2]:
         chosen_op    = meta.get("threshold", {})
         crit         = meta.get("criterion", "f1")
 
-        st.markdown("#### Calibration metrics (held-out evaluation)")
+        st.markdown("#### Calibration metrics — held-out evaluation")
+
+        # Metric definition cards
+        metric_defs = [
+            ("ROC-AUC ↑", "#6366f1",
+             "Area Under the ROC Curve",
+             "Measures how well the model <b>ranks</b> defaulters above non-defaulters across all thresholds. "
+             "1.0 = perfect separation, 0.5 = random. <em>Higher is better.</em> "
+             "Not affected by calibration — purely about ranking."),
+            ("PR-AUC ↑", "#8b5cf6",
+             "Area Under the Precision-Recall Curve",
+             "Like ROC-AUC but focuses on the <b>minority class (defaults)</b>. "
+             "More informative than ROC-AUC when defaults are rare. <em>Higher is better.</em> "
+             "Rewards models that find more defaulters without too many false alarms."),
+            ("Brier Score ↓", "#f59e0b",
+             "Mean Squared Probability Error",
+             "Average squared difference between predicted probability and true label (0 or 1). "
+             "Formula: <code>mean((p̂ᵢ − yᵢ)²)</code>. Range 0–1. <em>Lower is better.</em> "
+             "Directly measures calibration quality — a well-calibrated model will have a low Brier score."),
+            ("Log-Loss ↓", "#10b981",
+             "Binary Cross-Entropy",
+             "Penalises confident wrong predictions exponentially. "
+             "Formula: <code>−mean(y·log(p̂) + (1−y)·log(1−p̂))</code>. <em>Lower is better.</em> "
+             "More sensitive than Brier to extreme mispredictions (e.g. predicting 95% chance of no default when default occurs)."),
+        ]
+
+        def_cols = st.columns(4)
+        for (label, color, title, body), col in zip(metric_defs, def_cols):
+            with col:
+                with st.popover(f"ⓘ {label}", use_container_width=True):
+                    st.markdown(f"**{title}**")
+                    st.markdown(body, unsafe_allow_html=True)
+
         key_cols = ["roc_auc", "pr_auc", "brier", "log_loss"]
         col_labels = ["ROC-AUC ↑", "PR-AUC ↑", "Brier ↓", "Log-Loss ↓"]
         table = pd.DataFrame(
@@ -667,6 +802,35 @@ with tabs[2]:
         )
         st.dataframe(table.style.format("{:.4f}"), use_container_width=True)
 
+        # Calibration method definitions
+        st.markdown("#### Calibration methods — what they do")
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown("""
+<div style="background:#161b27;border:1px solid #21293d;border-radius:12px;padding:14px 16px;">
+<div style="font-size:12px;font-weight:700;color:#8b96b4;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Uncalibrated</div>
+<div style="font-size:13.5px;color:#e2e8f0;line-height:1.6;">
+The raw model output. XGBoost outputs probabilities that often <b>underestimate or overestimate</b> true default rates — especially in the tails. Use as a relative rank, not an absolute probability.
+</div>
+</div>""", unsafe_allow_html=True)
+        with m2:
+            st.markdown("""
+<div style="background:#161b27;border:1px solid #21293d;border-radius:12px;padding:14px 16px;">
+<div style="font-size:12px;font-weight:700;color:#8b96b4;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Platt Scaling (Sigmoid)</div>
+<div style="font-size:13.5px;color:#e2e8f0;line-height:1.6;">
+Fits a <b>logistic regression on top</b> of the model scores using a held-out calibration set. Effective when the miscalibration is systematic and monotone. Fast, interpretable, but assumes S-shaped distortion.
+</div>
+</div>""", unsafe_allow_html=True)
+        with m3:
+            st.markdown("""
+<div style="background:#161b27;border:1px solid #21293d;border-radius:12px;padding:14px 16px;">
+<div style="font-size:12px;font-weight:700;color:#8b96b4;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Isotonic Regression</div>
+<div style="font-size:13.5px;color:#e2e8f0;line-height:1.6;">
+Fits a <b>non-parametric monotone function</b> to the calibration set. More flexible than Platt — can correct any shape of miscalibration. Requires more data to avoid overfitting. <b>Chosen here</b> as it achieves a lower Brier score.
+</div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown("")
         st.markdown("#### Operating threshold")
         if chosen_op:
             st.info(
