@@ -4,10 +4,11 @@ EDUCATION
 MARRIAGE
 avg_pay_amt
 avg_bill_amt
+credit_utilization
 repay_ratio_avg
 cur_recent
 paydown_ratio
-mpr
+payment_trend
 pay_status_current
 pay_status_avg
 pay_status_ema
