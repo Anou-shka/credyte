@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse, json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -20,39 +20,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from src.features import compute_features, FEATURE_COLUMNS_DEFAULT
+from src.features import featurize_table, read_table, align_to_schema, read_feature_schema, FEATURE_COLUMNS_DEFAULT
 
 
 # -------------------- I/O helpers --------------------
-def _load_any(path: Path) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Input not found: {path}")
-    if path.suffix.lower() in (".parquet", ".pq"):
-        return pd.read_parquet(path)
-    if path.suffix.lower() in (".csv", ".txt"):
-        return pd.read_csv(path)
-    raise ValueError(f"Unsupported file type: {path.suffix}")
-
-def _ensure_features(df: pd.DataFrame, months: int, halflife: int) -> pd.DataFrame:
-    """If engineered cols aren't present, build them; keep DEFAULT if present."""
-    has_eng = {"avg_pay_amt","avg_bill_amt","repay_ratio_avg","pay_status_current"}.issubset(df.columns)
-    y = df["DEFAULT"] if "DEFAULT" in df.columns else None
-    X = df.drop(columns=["DEFAULT"], errors="ignore")
-    if not has_eng:
-        X = compute_features(X, months_default=months, halflife=halflife, write_schema_to=None)
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    if y is not None:
-        X["DEFAULT"] = pd.to_numeric(y, errors="coerce").fillna(0).astype(int)
-    return X
-
-def _split_xy(df: pd.DataFrame, target: str = "DEFAULT") -> Tuple[pd.DataFrame, pd.Series]:
-    if target not in df.columns:
-        raise ValueError(f"Target '{target}' missing.")
-    y = df[target].astype(int)
-    X = df.drop(columns=[target])
-    return X, y
-
 def _load_model_path(model_choice: str, models_dir: Path) -> Path:
     if model_choice == "best":
         p = models_dir / "best.joblib"
@@ -63,6 +34,22 @@ def _load_model_path(model_choice: str, models_dir: Path) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"Model not found at {p}")
     return p
+
+def _holdout_positions(models_dir: Path, n_rows: int) -> np.ndarray:
+    """Rows train.py held out. Calibrating on training rows would leak (the model is overconfident there)."""
+    splits_path = models_dir / "splits.json"
+    if not splits_path.exists():
+        raise FileNotFoundError(
+            f"{splits_path} not found. Re-run `python -m src.train` so calibration can use rows "
+            "the model was not trained on."
+        )
+    splits = json.loads(splits_path.read_text())
+    if int(splits["n_rows"]) != n_rows:
+        raise ValueError(
+            f"{splits_path} was written for {splits['n_rows']} rows but the input has {n_rows}. "
+            "Calibrate on the same file the model was trained on."
+        )
+    return np.asarray(splits["holdout_positions"], dtype=int)
 
 
 # -------------------- Metrics & thresholding --------------------
@@ -113,7 +100,7 @@ def pick_threshold(curve: pd.DataFrame, criterion: str = "f1") -> Dict[str, floa
 
 # -------------------- Plotting --------------------
 def plot_reliability(y: np.ndarray, p: np.ndarray, title: str, out_path: Path) -> None:
-    frac_pos, mean_pred = calibration_curve(y, p, n_bins=20, strategy="quantile")
+    frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="quantile")
     plt.figure(figsize=(4.8, 4.2))
     plt.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect")
     plt.plot(mean_pred, frac_pos, marker="o", lw=1.5, label=title)
@@ -130,14 +117,19 @@ def plot_reliability(y: np.ndarray, p: np.ndarray, title: str, out_path: Path) -
 # -------------------- Calibrator compat helper --------------------
 def _calibrator_prefit(estimator, method: str):
     """
-    Create CalibratedClassifierCV for a **pre-fit** estimator.
-    sklearn>=1.1 uses 'estimator', older versions used 'base_estimator'.
+    CalibratedClassifierCV around an already-fitted estimator.
+    sklearn>=1.6 uses FrozenEstimator (cv="prefit" is removed in 1.8);
+    older versions use cv="prefit".
     """
     try:
-        # new API
+        from sklearn.frozen import FrozenEstimator
+        return CalibratedClassifierCV(FrozenEstimator(estimator), method=method)
+    except ImportError:
+        pass
+    try:
         return CalibratedClassifierCV(estimator=estimator, method=method, cv="prefit")
     except TypeError:
-        # old API
+        # sklearn<1.2
         return CalibratedClassifierCV(base_estimator=estimator, method=method, cv="prefit")
 
 
@@ -153,32 +145,31 @@ def main(
     calib_frac: float,
     seed: int,
     threshold_criterion: str,
+    plots_dir: Path = Path("images/calibration"),
 ):
-    # 1) Load data -> features
-    if features_path:
-        df_in = _load_any(features_path)
-    else:
-        df_in = _load_any(input_path)
-    feats = _ensure_features(df_in, months=months, halflife=halflife)
-    X_all, y_all = _split_xy(feats, "DEFAULT")
+    # 1) Load data -> features (same row order as train.py saw)
+    df_in = read_table(features_path or input_path)
+    X_all, y_all = featurize_table(df_in, months=months, halflife=halflife)
+    if y_all is None:
+        raise ValueError("Target 'DEFAULT' missing.")
+    X_all = X_all.reset_index(drop=True)
+    y_all = y_all.reset_index(drop=True)
 
-    # 2) Align to training schema if available
-    schema_path = models_dir / "feature_columns.txt"
-    if schema_path.exists():
-        with open(schema_path) as f:
-            cols = [ln.strip() for ln in f if ln.strip()]
-        X_all = X_all.reindex(columns=cols).fillna(0.0)
+    # 2) Align to training schema
+    cols = read_feature_schema(models_dir / "feature_columns.txt") or FEATURE_COLUMNS_DEFAULT
+    X_all = align_to_schema(X_all, cols)
 
     # 3) Load pre-fit model
     model_path = _load_model_path(model_choice, models_dir)
     base_model = joblib.load(model_path)
 
-    # 4) Create eval / calibration split (eval gets the larger chunk by default)
+    # 4) Split the *holdout* rows into calibration / evaluation halves
+    ho = _holdout_positions(models_dir, len(X_all))
+    X_ho, y_ho = X_all.iloc[ho], y_all.iloc[ho]
     sss = StratifiedShuffleSplit(n_splits=1, test_size=calib_frac, random_state=seed)
-    train_idx, calib_idx = next(sss.split(X_all, y_all))
-    eval_idx = train_idx             # larger split → used for evaluation/threshold selection
-    X_eval, y_eval = X_all.iloc[eval_idx], y_all.iloc[eval_idx].values
-    X_cal,  y_cal  = X_all.iloc[calib_idx], y_all.iloc[calib_idx].values
+    eval_idx, calib_idx = next(sss.split(X_ho, y_ho))
+    X_eval, y_eval = X_ho.iloc[eval_idx], y_ho.iloc[eval_idx].values
+    X_cal,  y_cal  = X_ho.iloc[calib_idx], y_ho.iloc[calib_idx].values
 
     # 5) Uncalibrated baseline metrics (on eval)
     p_base_eval = base_model.predict_proba(X_eval)[:, 1]
@@ -219,7 +210,8 @@ def main(
 
     metrics_payload = {
         "base_model": str(model_path),
-        "splits": {"n_total": int(len(X_all)), "n_eval": int(len(X_eval)), "n_calib": int(len(X_cal))},
+        "splits": {"n_total": int(len(X_all)), "n_holdout": int(len(X_ho)),
+                   "n_eval": int(len(X_eval)), "n_calib": int(len(X_cal))},
         "uncalibrated_eval": base_metrics,
         "platt_eval": platt_metrics,
         "isotonic_eval": iso_metrics,
@@ -235,14 +227,14 @@ def main(
         json.dump({"method": chosen_name, **chosen_op}, f, indent=2)
 
     # 10) Reliability plots
-    cal_dir = Path("images/calibration")
+    cal_dir = plots_dir
     plot_reliability(y_eval, p_base_eval,   "Uncalibrated",      cal_dir / "reliability_uncalibrated.png")
     plot_reliability(y_eval, p_platt_eval,  "Platt (sigmoid)",   cal_dir / "reliability_platt.png")
     plot_reliability(y_eval, p_iso_eval,    "Isotonic",          cal_dir / "reliability_isotonic.png")
 
     print(f"[done] Saved calibrated models to {out_models_dir}")
     print(f"[done] Operating point: {chosen_op} (method={chosen_name})")
-    print(f"[info] Reliability plots → images/calibration/")
+    print(f"[info] Reliability plots → {cal_dir}/")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -255,9 +247,11 @@ if __name__ == "__main__":
     ap.add_argument("--out_models", type=Path, default=Path("models"))
     ap.add_argument("--months", type=int, default=6)
     ap.add_argument("--halflife", type=int, default=3)
-    ap.add_argument("--calib_frac", type=float, default=0.5, help="Fraction as calibration split; rest is eval.")
+    ap.add_argument("--calib_frac", type=float, default=0.5,
+                    help="Fraction of the training holdout used to fit calibrators; the rest is for evaluation.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--criterion", type=str, default="f1", choices=["f1","youden","balanced_acc"])
+    ap.add_argument("--plots_dir", type=Path, default=Path("images/calibration"))
     args = ap.parse_args()
 
     main(
@@ -271,4 +265,5 @@ if __name__ == "__main__":
         calib_frac=args.calib_frac,
         seed=args.seed,
         threshold_criterion=args.criterion,
+        plots_dir=args.plots_dir,
     )

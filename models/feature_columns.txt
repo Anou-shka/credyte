@@ -14,4 +14,3 @@ pay_status_avg
 pay_status_ema
 pay_is_delinquent
 pay_severity
-MONTHS

@@ -16,8 +16,13 @@ import streamlit.components.v1 as components
 from src.features import (
     build_single_from_minimal,
     compute_features,
+    read_feature_schema,
     FEATURE_COLUMNS_DEFAULT,
+    FEATURE_LABELS,
+    HALFLIFE_DEFAULT,
+    MONTHS_DEFAULT,
 )
+from src.score import default_bands
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -185,24 +190,33 @@ details summary { font-size: 13px; }
 
 # ---------- Paths ----------
 DATA_PATH      = Path("data/final_dataset.csv")
-FEATURES_TXT   = Path("models/feature_columns.txt")
-BEST_PATH      = Path("models/best.joblib")
-BASE_PATH      = Path("models/baseline.joblib")
-CALIBRATED_PATH= Path("models/calibrated_best.joblib")
-OP_POINT_PATH  = Path("models/operating_point.json")
+MODELS_DIR     = Path("models")
+FEATURES_TXT   = MODELS_DIR / "feature_columns.txt"
+BEST_PATH      = MODELS_DIR / "best.joblib"
+BASE_PATH      = MODELS_DIR / "baseline.joblib"
+CALIBRATED_PATH= MODELS_DIR / "calibrated_best.joblib"
+METRICS_PATH   = MODELS_DIR / "metrics.json"
+CAL_METRICS_PATH = MODELS_DIR / "calibration_metrics.json"
 SHAP_DIR       = Path("images/shap")
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
 # ---------- Schema ----------
 def load_feature_schema() -> List[str]:
-    if FEATURES_TXT.exists():
-        cols = [ln.strip() for ln in FEATURES_TXT.read_text().splitlines() if ln.strip()]
-        if cols:
-            return cols
-    return FEATURE_COLUMNS_DEFAULT
+    return read_feature_schema(FEATURES_TXT) or FEATURE_COLUMNS_DEFAULT
+
+
+def load_feature_params() -> tuple:
+    """Feature-engineering params the models were trained with (must match at inference)."""
+    params = _read_json(METRICS_PATH).get("params", {})
+    return int(params.get("months", MONTHS_DEFAULT)), int(params.get("halflife", HALFLIFE_DEFAULT))
 
 
 # ---------- Model loading ----------
+@st.cache_resource(show_spinner=False)
 def load_models_and_threshold():
     if CALIBRATED_PATH.exists():
         scoring_model = joblib.load(CALIBRATED_PATH); scoring_tag = "calibrated"
@@ -211,23 +225,32 @@ def load_models_and_threshold():
     elif BASE_PATH.exists():
         scoring_model = joblib.load(BASE_PATH); scoring_tag = "baseline"
     else:
-        st.error("No model found in models/. Run src/train.py first.")
-        st.stop()
+        return None
 
     shap_path  = BEST_PATH if BEST_PATH.exists() else BASE_PATH
     shap_model = joblib.load(shap_path)
     shap_tag   = "best" if shap_path == BEST_PATH else "baseline"
 
-    if OP_POINT_PATH.exists():
-        op = json.loads(OP_POINT_PATH.read_text())
-        t  = float(op["threshold"])
-        default_low  = max(0.0, t - 0.10)
-        default_high = min(1.0, t + 0.10)
-    else:
-        op = None
-        default_low, default_high = 0.25, 0.50
-
+    (default_low, default_high), op = default_bands(MODELS_DIR)
     return scoring_model, scoring_tag, shap_model, shap_tag, (default_low, default_high), op
+
+
+@st.cache_data(show_spinner=False)
+def load_background(schema: tuple, months: int, halflife: int, n: int = 800) -> pd.DataFrame:
+    """Random (not head-of-file) sample of engineered training rows, aligned to the schema."""
+    df = pd.read_csv(DATA_PATH).drop(columns=["DEFAULT"], errors="ignore")
+    df = df.sample(n=min(n, len(df)), random_state=17)
+    X = compute_features(df, months_default=months, halflife=halflife)
+    return X.reindex(columns=list(schema)).fillna(0.0)
+
+
+@st.cache_resource(show_spinner=False)
+def get_explainer(_model, model_key: str, schema: tuple, months: int, halflife: int):
+    if DATA_PATH.exists():
+        X_bg = load_background(schema, months, halflife)
+    else:
+        X_bg = None
+    return make_explainer(_model, X_bg, list(schema))
 
 
 # ---------- Helpers ----------
@@ -245,9 +268,20 @@ def align_series_to_schema(s: pd.Series, schema: List[str]) -> pd.Series:
 
 
 # ---------- SHAP explainer ----------
-def make_explainer(model, X_bg: pd.DataFrame, feature_cols: List[str]):
+def make_explainer(model, X_bg, feature_cols: List[str]):
+    """Returns (explainer, preprocessor or None, kind). X_bg may be None only for tree models."""
     from sklearn.pipeline import Pipeline
     from sklearn.linear_model import LogisticRegression
+
+    name = type(model).__name__.lower()
+    if "xgb" in name or "lgb" in name:
+        try:
+            # path-dependent TreeExplainer needs no background data
+            return shap.TreeExplainer(model), None, "tree"
+        except Exception:
+            pass
+    if X_bg is None:
+        raise RuntimeError(f"{DATA_PATH} is needed as SHAP background data for this model type.")
 
     if isinstance(model, Pipeline):
         pre = Pipeline(model.steps[:-1]) if len(model.steps) > 1 else None
@@ -261,17 +295,11 @@ def make_explainer(model, X_bg: pd.DataFrame, feature_cols: List[str]):
                 return shap.Explainer(est, X_bg_df), pre, "generic"
         return shap.Explainer(model, X_bg), None, "pipeline-generic"
 
-    name = type(model).__name__.lower()
-    if "xgb" in name or "lgb" in name:
-        try:
-            return shap.TreeExplainer(model), None, "tree"
-        except Exception:
-            pass
     return shap.Explainer(model, X_bg), None, "generic"
 
 
 # ---------- Gauge plot ----------
-def render_gauge(proba: float, band: str) -> None:
+def render_gauge(proba: float, band: str, low: float, high: float) -> None:
     color_map = {"Low": "#10b981", "Medium": "#f59e0b", "High": "#ef4444"}
     color = color_map.get(band, "#6366f1")
 
@@ -284,11 +312,11 @@ def render_gauge(proba: float, band: str) -> None:
     theta_bg = np.linspace(np.pi, 0, n)
     ax.plot(theta_bg, [1]*n, color="#21293d", linewidth=14, solid_capstyle="round")
 
-    # Zone colouring: low=green, med=amber, high=red
+    # Zone colouring follows the active band thresholds: low=green, med=amber, high=red
     for zone_start, zone_end, zone_color in [
-        (np.pi,       np.pi*0.65, "#10b981"),
-        (np.pi*0.65,  np.pi*0.35, "#f59e0b"),
-        (np.pi*0.35,  0,          "#ef4444"),
+        (np.pi,                 np.pi*(1 - low),  "#10b981"),
+        (np.pi*(1 - low),       np.pi*(1 - high), "#f59e0b"),
+        (np.pi*(1 - high),      0,                "#ef4444"),
     ]:
         zone_theta = np.linspace(zone_start, zone_end, 100)
         ax.plot(zone_theta, [1]*100, color=zone_color, linewidth=14, alpha=0.20, solid_capstyle="butt")
@@ -321,58 +349,36 @@ def render_gauge(proba: float, band: str) -> None:
 
 
 # ---------- Waterfall SHAP ----------
-def render_waterfall(explainer, shap_row: np.ndarray, X_one_shap: pd.DataFrame) -> None:
+def render_waterfall(explainer, shap_row: np.ndarray, X_one_raw: pd.DataFrame) -> None:
     base_val = explainer.expected_value
     if isinstance(base_val, (list, np.ndarray)):
-        base_val = float(np.array(base_val).ravel()[0])
+        base_val = float(np.array(base_val).ravel()[-1])
 
     exp = shap.Explanation(
         values=shap_row,
         base_values=base_val,
-        data=X_one_shap.iloc[0].values,
-        feature_names=list(X_one_shap.columns),
+        data=X_one_raw.iloc[0].values,          # show the borrower's real (unscaled) values
+        feature_names=[PRETTY_NAMES.get(c, c) for c in X_one_raw.columns],
     )
 
-    plt.style.use("dark_background")
-    fig = plt.figure(figsize=(9, 4.5), facecolor="#161b27")
-    ax = fig.add_subplot(111)
-    ax.set_facecolor("#161b27")
-
-    shap.plots.waterfall(exp, max_display=12, show=False)
-
-    fig.patch.set_facecolor("#161b27")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#21293d")
-    ax.tick_params(colors="#8b96b4")
-    ax.xaxis.label.set_color("#8b96b4")
-
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-    plt.style.use("default")
+    with plt.style.context("dark_background"):
+        plt.figure(figsize=(9, 4.5), facecolor="#161b27")
+        shap.plots.waterfall(exp, max_display=12, show=False)
+        fig = plt.gcf()
+        fig.patch.set_facecolor("#161b27")
+        for ax in fig.axes:
+            ax.set_facecolor("#161b27")
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#21293d")
+            ax.tick_params(colors="#8b96b4")
+            ax.xaxis.label.set_color("#8b96b4")
+        plt.tight_layout()
+        st.pyplot(fig, clear_figure=True)
+    plt.close("all")
 
 
 # ---------- Ratio cards ----------
-PRETTY_NAMES = {
-    "avg_pay_amt":        "Avg Monthly Payment",
-    "avg_bill_amt":       "Avg Monthly Bill",
-    "credit_utilization": "Credit Utilization",
-    "repay_ratio_avg":    "Payment Coverage",
-    "cur_recent":         "Latest Pay Coverage",
-    "paydown_ratio":      "Paydown Rate",
-    "payment_trend":      "Payment Trend",
-    "pay_status_current": "Pay Status (Current)",
-    "pay_status_avg":     "Pay Status (Avg)",
-    "pay_status_ema":     "Pay Status (EMA)",
-    "pay_status_ema":     "Pay Status (Trend)",
-    "LIMIT_BAL":          "Credit Limit",
-    "AGE":                "Age",
-    "EDUCATION":          "Education",
-    "MARRIAGE":           "Marital Status",
-    "MONTHS":             "History (Months)",
-    "pay_is_delinquent":  "Delinquent",
-    "pay_severity":       "Delinquency Severity",
-    "paydown_ratio":      "Paydown Rate",
-}
+PRETTY_NAMES = FEATURE_LABELS
 
 
 def _ratio_cards(ui: dict) -> None:
@@ -412,15 +418,18 @@ def _ratio_cards(ui: dict) -> None:
 # ---------- Driver chips ----------
 def _driver_chips(shap_row: np.ndarray, schema: List[str], X_one_row: pd.Series) -> None:
     s = pd.Series(shap_row, index=schema)
-    ups   = s.nlargest(3)
-    downs = s.nsmallest(3)
+    ups   = s[s > 0].nlargest(3)
+    downs = s[s < 0].nsmallest(3)
 
     def make_cards(vals: pd.Series, cls: str) -> str:
+        if vals.empty:
+            return '<div style="font-size:12px;color:#8b96b4;">None for this borrower.</div>'
         html = ""
         for k in vals.index:
             raw = X_one_row.get(k, 0)
             try:
-                display_val = f"{float(raw):.3g}"
+                v = float(raw)
+                display_val = f"{v:,.0f}" if abs(v) >= 1000 else f"{v:.3g}"
             except Exception:
                 display_val = str(raw)
             html += (
@@ -435,7 +444,7 @@ def _driver_chips(shap_row: np.ndarray, schema: List[str], X_one_row: pd.Series)
     st.markdown("""
 <div style="background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.18);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#9aa6d1;line-height:1.6;">
   <b style="color:#a5b4fc;">How to read this:</b>&nbsp;
-  These are the three features with the <b>largest SHAP values</b> for this borrower — the ones that pushed the predicted default risk highest (↑) or lowest (↓).
+  These are up to three features with the <b>largest positive</b> (↑) and <b>largest negative</b> (↓) SHAP values for this borrower — the ones that pushed the predicted default risk up or down the most.
   The displayed number is the <b>actual feature value</b> for this borrower, not the SHAP impact.
   A high <em>credit utilization</em> borrower will appear on the risk side even if they paid on time, because utilization alone carries significant predictive weight.
 </div>
@@ -457,22 +466,34 @@ def _driver_chips(shap_row: np.ndarray, schema: List[str], X_one_row: pd.Series)
 
 # ---------- Load artifacts ----------
 schema = load_feature_schema()
-scoring_model, scoring_tag, shap_model, shap_tag, (def_low, def_high), op_meta = load_models_and_threshold()
+months, halflife = load_feature_params()
+_loaded = load_models_and_threshold()
+if _loaded is None:
+    st.error("No model found in models/. Run `python -m src.train` first.")
+    st.stop()
+scoring_model, scoring_tag, shap_model, shap_tag, (def_low, def_high), op_meta = _loaded
+_metrics = _read_json(METRICS_PATH)
+_cal_meta = _read_json(CAL_METRICS_PATH)
+_model_label = {"xgboost": "XGBoost", "lightgbm": "LightGBM", "logreg": "Logistic Regression"}.get(
+    _metrics.get("best", {}).get("name", ""), "ML model")
+_cal_label = {"isotonic": "Isotonic", "platt": "Platt"}.get(
+    _cal_meta.get("chosen", {}).get("method", ""), "")
+_stack_label = f"{_model_label} + {_cal_label}" if scoring_tag == "calibrated" and _cal_label else _model_label
 
 # ---------- Header ----------
-st.markdown("""
+st.markdown(f"""
 <div class="hero">
   <span class="hero-icon">⬡</span>
   <h1>Credyte</h1>
   <p class="hero-sub">
-    Enterprise-grade credit risk analytics — predict probability of default with calibrated ML,
-    decompose every decision with SHAP, and track financial health ratios in real time.
+    Credit risk scoring for credit-card borrowers — estimate the probability of default with a
+    calibrated gradient-boosted model, see exactly why with SHAP, and review key financial ratios.
   </p>
   <div class="hero-pills">
     <span class="hero-pill">Calibrated PD Scoring</span>
     <span class="hero-pill">SHAP Explainability</span>
     <span class="hero-pill">Financial Ratio Engine</span>
-    <span class="hero-pill">XGBoost + Isotonic</span>
+    <span class="hero-pill">{_stack_label}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -481,17 +502,16 @@ st.markdown("""
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
     st.markdown("**Risk Band Thresholds**")
-    low_thr  = st.slider("Low / Medium cutoff", 0.0, 1.0, def_low,  0.01)
-    high_thr = st.slider("Medium / High cutoff", 0.0, 1.0, def_high, 0.01)
-    st.divider()
-    st.markdown("**Feature Engineering**")
-    months   = st.slider("Months in history", 2, 12, 6, 1, help="History length for running averages")
-    halflife = st.slider("PAY EMA half-life", 1, 12, 3, 1, help="Memory for payment status trend")
+    low_thr  = st.slider("Low / Medium cutoff", 0.0, 1.0, round(def_low, 2),  0.01)
+    high_thr = st.slider("Medium / High cutoff", 0.0, 1.0, round(def_high, 2), 0.01)
+    if low_thr >= high_thr:
+        st.error("The Low/Medium cutoff must be below the Medium/High cutoff. Using the defaults.")
+        low_thr, high_thr = def_low, def_high
     st.divider()
     st.caption(f"Scoring: **{scoring_tag}** · SHAP base: **{shap_tag}**")
-    st.caption(f"Features: **{len(schema)}**")
+    st.caption(f"Features: **{len(schema)}** · history **{months}** months · EMA half-life **{halflife}**")
     if op_meta:
-        st.caption(f"Operating point (F1): **t = {op_meta['threshold']:.3f}**")
+        st.caption(f"Operating point ({op_meta.get('criterion', 'f1').upper()}): **t = {op_meta['threshold']:.3f}**")
 
 tabs = st.tabs(["🔮 Predict", "🌍 Global SHAP", "📐 Calibration"])
 
@@ -499,17 +519,18 @@ tabs = st.tabs(["🔮 Predict", "🌍 Global SHAP", "📐 Calibration"])
 # Tab 1 — Predict
 # =========================================================
 with tabs[0]:
+    # UCI repayment status codes (PAY_0 … PAY_6)
     pay_map = {
-        "Paid in full (-1)": -1, "On time (0)": 0,
-        "1 month late": 1, "2 months late": 2, "3 months late": 3,
-        "4 months late": 4, "5 months late": 5,
+        "No consumption (-2)": -2, "Paid in full (-1)": -1, "Revolving credit, min. paid (0)": 0,
+        "1 month late": 1, "2 months late": 2, "3 months late": 3, "4 months late": 4,
+        "5 months late": 5, "6 months late": 6, "7 months late": 7, "8+ months late": 8,
     }
     edu_map = {"Graduate school": 1, "University": 2, "High school": 3, "Other": 4}
     mar_map = {"Married": 1, "Single": 2, "Other": 3}
 
     st.markdown('<div class="section-header">Borrower Profile</div>', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
-    LIMIT_BAL  = c1.number_input("Credit Limit (NT$)", value=120_000.0, step=5_000.0, format="%.0f")
+    LIMIT_BAL  = c1.number_input("Credit Limit (NT$)", value=120_000.0, min_value=1_000.0, step=5_000.0, format="%.0f")
     AGE        = c2.number_input("Age", value=32, min_value=18, max_value=100, step=1)
     edu_label  = c3.selectbox("Education", list(edu_map.keys()), index=1)
     mar_label  = c4.selectbox("Marital Status", list(mar_map.keys()), index=1)
@@ -517,18 +538,19 @@ with tabs[0]:
 
     st.markdown('<div class="section-header">Latest Month</div>', unsafe_allow_html=True)
     c5, c6, c7 = st.columns(3)
-    pay_label      = c5.selectbox("Payment Status", list(pay_map.keys()), index=2)
+    pay_label      = c5.selectbox("Payment Status", list(pay_map.keys()), index=3)
     PAY_STATUS     = pay_map[pay_label]
-    PAY_AMT_LATEST = c6.number_input("Payment Amount (NT$)", value=1_800.0, step=100.0, format="%.0f")
-    BILL_AMT_LATEST= c7.number_input("Bill Amount (NT$)", value=22_000.0, step=500.0, format="%.0f")
+    PAY_AMT_LATEST = c6.number_input("Payment Amount (NT$)", value=1_800.0, min_value=0.0, step=100.0, format="%.0f")
+    BILL_AMT_LATEST= c7.number_input("Bill Amount (NT$)", value=22_000.0, step=500.0, format="%.0f",
+                                     help="Negative means a credit balance (nothing owed).")
 
-    st.markdown('<div class="section-header">Prior History (Running Averages)</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-header">Prior History — averages over the {months - 1} months before the latest</div>', unsafe_allow_html=True)
     c8, c9, c10 = st.columns(3)
-    AVG_PAY_AMT_PRIOR  = c8.number_input("Prior Avg Payment (NT$)", value=1_500.0, step=100.0, format="%.0f")
+    AVG_PAY_AMT_PRIOR  = c8.number_input("Prior Avg Payment (NT$)", value=1_500.0, min_value=0.0, step=100.0, format="%.0f")
     AVG_BILL_AMT_PRIOR = c9.number_input("Prior Avg Bill (NT$)", value=20_000.0, step=500.0, format="%.0f")
     PRIOR_PAY_AVG      = c10.number_input(
-        "Prior Pay Status Avg", value=float(max(-1, PAY_STATUS - 1)), step=0.5,
-        help="Running average of past PAY codes (−1 to 5)"
+        "Prior Pay Status Avg", value=float(max(-2, PAY_STATUS - 1)), min_value=-2.0, max_value=8.0, step=0.5,
+        help="Average of past payment status codes (−2 to 8)"
     )
 
     predict_btn = st.button("Predict Default Risk", use_container_width=True, type="primary")
@@ -554,7 +576,7 @@ with tabs[0]:
 
         gauge_col, pd_col, thresh_col = st.columns([1, 1, 2])
         with gauge_col:
-            render_gauge(proba, band)
+            render_gauge(proba, band, low_thr, high_thr)
 
         with pd_col:
             st.markdown(f"""
@@ -594,20 +616,11 @@ with tabs[0]:
         # SHAP computation
         shap_row = None
         explainer = None
-        X_one_shap = X_one
         try:
-            if DATA_PATH.exists():
-                df_bg = pd.read_csv(DATA_PATH).head(800).drop(columns=["DEFAULT"], errors="ignore")
-                X_bg = compute_features(df_bg, months_default=months, halflife=halflife, write_schema_to=None)
-                X_bg = X_bg[[c for c in schema if c in X_bg.columns]].fillna(0.0)
-            else:
-                X_bg = pd.concat([X_one]*64, ignore_index=True)
-
-            X_bg = X_bg.reindex(columns=schema).fillna(0.0)
-            explainer, preproc, kind = make_explainer(shap_model, X_bg, schema)
+            explainer, preproc, kind = get_explainer(shap_model, shap_tag, tuple(schema), months, halflife)
             X_one_shap = (
                 pd.DataFrame(preproc.transform(X_one), index=X_one.index, columns=schema)
-                if preproc is not None and kind in ("linear", "generic") else X_one
+                if preproc is not None else X_one
             )
             vals = explainer(X_one_shap)
             shap_row = vals.values[0] if hasattr(vals, "values") else np.array(vals)[0]
@@ -615,7 +628,7 @@ with tabs[0]:
             st.warning(f"SHAP unavailable: {e}")
 
         if shap_row is not None:
-            _driver_chips(shap_row, schema, X_one_shap.iloc[0])
+            _driver_chips(shap_row, schema, X_one.iloc[0])
 
             st.markdown('<div class="section-header">Why this prediction? — SHAP Waterfall</div>', unsafe_allow_html=True)
             st.markdown("""
@@ -623,11 +636,11 @@ with tabs[0]:
   <b style="color:#a5b4fc;">How SHAP works:</b>&nbsp;
   SHAP (SHapley Additive exPlanations) decomposes the model's output into per-feature contributions, grounded in cooperative game theory.
   The waterfall starts from the <b>baseline</b> — the average model output across all borrowers (E[f(x)]) — and each bar shows how much a single feature <b>raises</b> (red, →) or <b>lowers</b> (blue, ←) the final score.
-  The bars stack to reach <b>f(x)</b>, the raw model score for this borrower.
+  The bars stack to reach <b>f(x)</b>, the uncalibrated model's raw score (log-odds) for this borrower — the PD above is that score after calibration.
   Features are sorted by impact magnitude — the top bar has the biggest influence on this specific prediction.
 </div>
 """, unsafe_allow_html=True)
-            render_waterfall(explainer, shap_row, X_one_shap)
+            render_waterfall(explainer, shap_row, X_one)
 
             with st.expander("All feature contributions (|SHAP|)"):
                 contrib = (
@@ -656,14 +669,13 @@ with tabs[1]:
         if DATA_PATH.exists():
             try:
                 df_raw = pd.read_csv(DATA_PATH).drop(columns=["DEFAULT"], errors="ignore")
-                X_all  = compute_features(df_raw, months_default=months, halflife=halflife, write_schema_to=None)
-                X_all  = X_all[[c for c in schema if c in X_all.columns]].fillna(0.0)
+                X_all  = compute_features(df_raw, months_default=months, halflife=halflife)
                 X_all  = X_all.reindex(columns=schema).fillna(0.0)
                 X_samp = X_all.sample(n=min(1500, len(X_all)), random_state=17)
 
                 explainer_g, preproc_g, kind_g = make_explainer(shap_model, X_samp, schema)
                 X_plot = X_samp
-                if preproc_g is not None and kind_g in ("linear", "generic"):
+                if preproc_g is not None:
                     X_plot = pd.DataFrame(preproc_g.transform(X_samp), index=X_samp.index, columns=schema)
                 vals_g = explainer_g(X_plot)
                 sv = vals_g.values if hasattr(vals_g, "values") else np.array(vals_g)
@@ -690,23 +702,22 @@ with tabs[1]:
     """)
 
     GLOSSARY = {
-        "pay_status_current":  "Latest payment code (−1 paid in full, 0 on time, 1–5 months late).",
+        "pay_status_current":  "Latest payment code (−2 no consumption, −1 paid in full, 0 revolving credit, 1–8 months late).",
         "pay_status_ema":      "Exponential moving average of recent payment codes — tracks the trend.",
         "pay_status_avg":      "Simple running average of past payment codes.",
         "credit_utilization":  "Average monthly bill as a fraction of credit limit — how much credit is being used.",
-        "repay_ratio_avg":     "Avg payment / avg bill — overall payment coverage rate.",
-        "cur_recent":          "Latest payment / latest bill — most recent month's coverage.",
+        "repay_ratio_avg":     "Avg payment / avg bill, capped at 100% — overall payment coverage rate (100% when nothing is owed).",
+        "cur_recent":          "Latest payment / latest bill, capped at 100% — most recent month's coverage (100% when nothing is owed).",
         "paydown_ratio":       "Avg payment / credit limit — how aggressively the balance is being paid down.",
-        "payment_trend":       "(Latest pay − prior avg) / prior avg — is payment behaviour improving or worsening?",
+        "payment_trend":       "(Latest pay − prior avg pay) / (prior avg pay + 1), capped to ±1 — is payment behaviour improving or worsening?",
         "pay_is_delinquent":   "Binary: 1 if current pay code ≥ 1 (any lateness).",
-        "pay_severity":        "pay_status_current / 8 — normalized lateness severity.",
+        "pay_severity":        "max(0, pay_status_current) / 8 — normalized lateness severity.",
         "avg_bill_amt":        "Updated average monthly bill (including latest).",
         "avg_pay_amt":         "Updated average monthly payment (including latest).",
         "LIMIT_BAL":           "Credit limit in NT dollars.",
         "AGE":                 "Borrower age.",
         "EDUCATION":           "1=Grad school, 2=University, 3=High school, 4=Other.",
         "MARRIAGE":            "1=Married, 2=Single, 3=Other.",
-        "MONTHS":              "Number of months of history used for running averages.",
     }
     with st.expander("Feature glossary"):
         for k in [f for f in schema if f in GLOSSARY]:
@@ -743,9 +754,8 @@ with tabs[2]:
 </div>
 """, unsafe_allow_html=True)
 
-    met_path = Path("models/calibration_metrics.json")
-    if met_path.exists():
-        meta         = json.loads(met_path.read_text())
+    if _cal_meta:
+        meta         = _cal_meta
         base_m       = meta.get("uncalibrated_eval", {})
         platt_m      = meta.get("platt_eval", {})
         iso_m        = meta.get("isotonic_eval", {})
@@ -755,7 +765,10 @@ with tabs[2]:
         chosen_op    = meta.get("threshold", {})
         crit         = meta.get("criterion", "f1")
 
+        n_eval = meta.get("splits", {}).get("n_eval")
         st.markdown("#### Calibration metrics — held-out evaluation")
+        if n_eval:
+            st.caption(f"Computed on {n_eval:,} borrowers that were used neither for training nor for fitting the calibrators.")
 
         # Metric definition cards
         metric_defs = [
@@ -804,6 +817,7 @@ with tabs[2]:
 
         # Calibration method definitions
         st.markdown("#### Calibration methods — what they do")
+        chosen_note = " <b>Chosen here</b> — it achieved the lower Brier score on the evaluation split."
         m1, m2, m3 = st.columns(3)
         with m1:
             st.markdown("""
@@ -814,19 +828,19 @@ The raw model output. XGBoost outputs probabilities that often <b>underestimate 
 </div>
 </div>""", unsafe_allow_html=True)
         with m2:
-            st.markdown("""
+            st.markdown(f"""
 <div style="background:#161b27;border:1px solid #21293d;border-radius:12px;padding:14px 16px;">
 <div style="font-size:12px;font-weight:700;color:#8b96b4;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Platt Scaling (Sigmoid)</div>
 <div style="font-size:13.5px;color:#e2e8f0;line-height:1.6;">
-Fits a <b>logistic regression on top</b> of the model scores using a held-out calibration set. Effective when the miscalibration is systematic and monotone. Fast, interpretable, but assumes S-shaped distortion.
+Fits a <b>logistic regression on top</b> of the model scores using a held-out calibration set. Effective when the miscalibration is systematic and monotone. Fast, interpretable, but assumes S-shaped distortion.{chosen_note if chosen_method == "platt" else ""}
 </div>
 </div>""", unsafe_allow_html=True)
         with m3:
-            st.markdown("""
+            st.markdown(f"""
 <div style="background:#161b27;border:1px solid #21293d;border-radius:12px;padding:14px 16px;">
 <div style="font-size:12px;font-weight:700;color:#8b96b4;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Isotonic Regression</div>
 <div style="font-size:13.5px;color:#e2e8f0;line-height:1.6;">
-Fits a <b>non-parametric monotone function</b> to the calibration set. More flexible than Platt — can correct any shape of miscalibration. Requires more data to avoid overfitting. <b>Chosen here</b> as it achieves a lower Brier score.
+Fits a <b>non-parametric monotone function</b> to the calibration set. More flexible than Platt — can correct any shape of miscalibration. Requires more data to avoid overfitting.{chosen_note if chosen_method == "isotonic" else ""}
 </div>
 </div>""", unsafe_allow_html=True)
 

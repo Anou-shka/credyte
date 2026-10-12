@@ -2,63 +2,60 @@
 from __future__ import annotations
 import argparse, json
 from pathlib import Path
+from typing import Optional, Tuple
 import numpy as np, pandas as pd, joblib
-from src.features import compute_features
+from src.features import featurize_table, read_table, align_to_schema, read_feature_schema, FEATURE_COLUMNS_DEFAULT
 
-def _load_any(p: Path) -> pd.DataFrame:
-    p = Path(p)
-    if p.suffix.lower() in (".parquet",".pq"): return pd.read_parquet(p)
-    if p.suffix.lower() in (".csv",".txt"):    return pd.read_csv(p)
-    raise ValueError(f"Unsupported: {p.suffix}")
+# Band edges when no operating point is available, and the half-width of the
+# Medium band around the operating threshold when one is. Shared with app.py.
+FALLBACK_BANDS = (0.25, 0.50)
+BAND_HALF_WIDTH = 0.10
+
+
+def default_bands(models_dir: Path = Path("models")) -> Tuple[Tuple[float, float], Optional[dict]]:
+    """(low, high) band edges centred on the calibrated operating threshold, plus the operating point."""
+    op_path = Path(models_dir) / "operating_point.json"
+    if not op_path.exists():
+        return FALLBACK_BANDS, None
+    op = json.loads(op_path.read_text())
+    t = float(op["threshold"])
+    return (max(0.0, t - BAND_HALF_WIDTH), min(1.0, t + BAND_HALF_WIDTH)), op
+
+
+def risk_band(p, low: float, high: float):
+    return np.where(np.asarray(p) < low, "Low", np.where(np.asarray(p) < high, "Medium", "High"))
+
 
 def load_scoring_and_schema(models_dir: Path):
     models_dir = Path(models_dir)
-    # model
-    path = models_dir/"calibrated_best.joblib"
-    tag = "calibrated"
-    if not path.exists():
-        path = models_dir/"best.joblib"; tag = "best" if path.exists() else tag
-    if not path.exists():
-        path = models_dir/"baseline.joblib"; tag = "baseline"
+    for name, tag in (("calibrated_best.joblib", "calibrated"), ("best.joblib", "best"), ("baseline.joblib", "baseline")):
+        path = models_dir / name
+        if path.exists():
+            break
+    else:
+        raise FileNotFoundError(f"No model found in {models_dir}. Run `python -m src.train` first.")
     model = joblib.load(path)
-    # schema
-    schema = None
-    sc = models_dir/"feature_columns.txt"
-    if sc.exists():
-        schema = [ln.strip() for ln in sc.read_text().splitlines() if ln.strip()]
+    schema = read_feature_schema(models_dir / "feature_columns.txt") or FEATURE_COLUMNS_DEFAULT
     return model, tag, schema
 
-def main(input_path: Path, features_path: Path|None, out_csv: Path,
+
+def main(input_path: Path, features_path: Path | None, out_csv: Path,
          models_dir: Path, months: int, halflife: int):
-    # load data
-    df = _load_any(features_path or input_path)
-    y = df["DEFAULT"] if "DEFAULT" in df.columns else None
-    X = df.drop(columns=["DEFAULT"], errors="ignore")
-    # ensure features
-    need = {"avg_pay_amt","avg_bill_amt","repay_ratio_avg","pay_status_current"}
-    if not need.issubset(X.columns):
-        X = compute_features(X, months_default=months, halflife=halflife, write_schema_to=None)
-    X = X.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    df = read_table(features_path or input_path)
+    X, _ = featurize_table(df, months=months, halflife=halflife)
 
     model, tag, schema = load_scoring_and_schema(models_dir)
-    if schema:
-        X = X.reindex(columns=[c for c in schema if c in X.columns]).fillna(0.0)
+    X = align_to_schema(X, schema)
 
-    p = model.predict_proba(X)[:,1]
     out = df.copy()
-    out["pd"] = p
+    out["pd"] = model.predict_proba(X)[:, 1]
 
-    # risk bands from operating point
-    op_path = Path(models_dir)/"operating_point.json"
-    if op_path.exists():
-        op = json.loads(op_path.read_text())
-        t = float(op["threshold"])
-        low, high = max(0.0,t-0.10), min(1.0,t+0.10)
-    else:
-        low, high = 0.30, 0.60
-    out["risk_band"] = np.where(out["pd"]<low,"Low", np.where(out["pd"]<high,"Medium","High"))
+    (low, high), _ = default_bands(models_dir)
+    out["risk_band"] = risk_band(out["pd"], low, high)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_csv, index=False)
-    print(f"[done] wrote {out_csv} with {len(out)} rows using model={tag}")
+    print(f"[done] wrote {out_csv} with {len(out)} rows using model={tag}; bands: Low<{low:.2f}≤Medium<{high:.2f}≤High")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

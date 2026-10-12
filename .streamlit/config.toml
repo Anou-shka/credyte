@@ -1,0 +1,7 @@
+# The app's custom CSS, charts and colours are designed for a dark background.
+[theme]
+base = "dark"
+primaryColor = "#6366f1"
+backgroundColor = "#0d1117"
+secondaryBackgroundColor = "#161b27"
+textColor = "#e2e8f0"

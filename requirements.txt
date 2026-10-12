@@ -1,23 +1,25 @@
+# Pinned so the pickled models in models/ load with the same library versions
+# they were trained with (sklearn/xgboost pickles are not stable across versions).
+
 # Core scientific stack
-numpy
-pandas
-scikit-learn
+numpy==2.2.6
+pandas==2.3.2
+scikit-learn==1.7.1
 
-# Imbalanced learning
-imblearn
+# Gradient boosting
+xgboost==3.0.4
 
-# Gradient boosting models
-xgboost
-lightgbm
-
-# Model explainability
-shap
-matplotlib
-seaborn
+# Model explainability / plotting
+shap==0.48.0
+matplotlib==3.10.5
 
 # App framework
-streamlit
+streamlit==1.48.1
 
 # Serialization
-joblib
+joblib==1.5.1
 
+# Optional:
+#   lightgbm      -> src/train.py also trains a LightGBM candidate when installed
+#   seaborn       -> correlation heatmap in notebook/data_cleaning_final.ipynb
+#   pytest        -> tests/

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - name: Unit tests
+        run: python -m pytest -q tests
+      - name: Smoke-test the app and batch scoring with the shipped models
+        run: |
+          python -m src.score --out /tmp/scored.csv
+          python - <<'PY'
+          from streamlit.testing.v1 import AppTest
+          at = AppTest.from_file("app.py", default_timeout=180).run()
+          at.button[0].click().run()
+          assert not at.exception, [e.value for e in at.exception]
+          print("app OK")
+          PY

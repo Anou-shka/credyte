@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -37,7 +36,7 @@ import matplotlib.pyplot as plt
 import shap
 
 # our feature builder
-from src.features import compute_features, FEATURE_COLUMNS_DEFAULT
+from src.features import featurize_table, read_table, align_to_schema, read_feature_schema, FEATURE_COLUMNS_DEFAULT, FEATURE_LABELS
 
 
 # ------------------------- Paths & Defaults -------------------------
@@ -50,59 +49,11 @@ BEST_PATH = Path("models/best.joblib")
 
 
 # ------------------------- Small utilities -------------------------
-def read_table(path: Path) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if path.suffix.lower() in (".parquet", ".pq"):
-        return pd.read_parquet(path)
-    if path.suffix.lower() in (".csv", ".txt"):
-        return pd.read_csv(path)
-    raise ValueError(f"Unsupported file type: {path.suffix}")
-
-
-def ensure_features(
-    raw_or_features: pd.DataFrame,
-    months_default: int,
-    halflife: int,
-) -> pd.DataFrame:
-    """
-    If engineered columns aren't present, build them using compute_features().
-    Leaves DEFAULT in place if it exists.
-    """
-    df = raw_or_features.copy()
-    target = None
-    if "DEFAULT" in df.columns:
-        target = df["DEFAULT"]
-        df = df.drop(columns=["DEFAULT"])
-
-    # if our engineered columns aren't there, build them
-    key_cols = {"avg_pay_amt", "avg_bill_amt", "repay_ratio_avg", "pay_status_current"}
-    if not key_cols.issubset(df.columns):
-        df = compute_features(df, months_default=months_default, halflife=halflife, write_schema_to=None)
-
-    # clean, then reattach target (if present)
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    if target is not None:
-        df["DEFAULT"] = pd.to_numeric(target, errors="coerce").fillna(0).astype(int)
-    return df
-
-
 def load_feature_list() -> Optional[list[str]]:
-    if FEATURES_TXT.exists():
-        with open(FEATURES_TXT) as f:
-            cols = [ln.strip() for ln in f if ln.strip()]
-        if cols:
-            print(f"[schema] Loaded {len(cols)} feature names from {FEATURES_TXT}")
-            return cols
-    return None
-
-
-def align_X(X: pd.DataFrame, feature_cols: Iterable[str]) -> pd.DataFrame:
-    miss = [c for c in feature_cols if c not in X.columns]
-    if miss:
-        raise ValueError(f"Missing required feature columns: {miss[:12]}{'...' if len(miss)>12 else ''}")
-    return X.loc[:, list(feature_cols)].copy()
+    cols = read_feature_schema(FEATURES_TXT)
+    if cols:
+        print(f"[schema] Loaded {len(cols)} feature names from {FEATURES_TXT}")
+    return cols
 
 
 def sample_background(X: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
@@ -113,6 +64,7 @@ def sample_background(X: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
 
 def save_summary_plots(shap_values, X_like: pd.DataFrame, outdir: Path, prefix: str):
     outdir.mkdir(parents=True, exist_ok=True)
+    X_like = X_like.rename(columns=FEATURE_LABELS)
     # bar
     plt.figure()
     shap.summary_plot(shap_values, X_like, plot_type="bar", show=False)
@@ -296,14 +248,13 @@ def main(
     else:
         raise ValueError("Provide either --input (raw CSV) or --features (engineered).")
 
-    # 2) Build features if needed (keep DEFAULT/id if present)
-    target = df_in["DEFAULT"] if "DEFAULT" in df_in.columns else None
-    ids = df_in["ID"] if "ID" in df_in.columns else None
-    feats = ensure_features(df_in, months_default=months, halflife=halflife)
+    # 2) Build features if needed (keep ID for naming force plots)
+    ids = df_in["ID"].reset_index(drop=True) if "ID" in df_in.columns else None
+    feats, _ = featurize_table(df_in, months=months, halflife=halflife)
 
     # 3) Align to feature schema
     feature_cols = load_feature_list() or FEATURE_COLUMNS_DEFAULT
-    X = align_X(feats, feature_cols)
+    X = align_to_schema(feats, feature_cols).reset_index(drop=True)
 
     # 4) Load models
     models = {}

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,12 @@ MINIMAL_INPUT_KEYS: List[str] = [
     "PRIOR_PAY_AVG",
 ]
 
+# Feature-engineering parameters the shipped models were trained with.
+# Changing them at inference time changes what the features mean, so the app
+# reads the values recorded in models/metrics.json instead of exposing knobs.
+MONTHS_DEFAULT = 6
+HALFLIFE_DEFAULT = 3
+
 FEATURE_COLUMNS_DEFAULT: List[str] = [
     "LIMIT_BAL", "AGE", "EDUCATION", "MARRIAGE",
     "avg_pay_amt", "avg_bill_amt",
@@ -26,72 +32,67 @@ FEATURE_COLUMNS_DEFAULT: List[str] = [
     "repay_ratio_avg",      # avg_pay / avg_bill — overall payment coverage
     "cur_recent",           # latest_pay / latest_bill — most recent payment coverage
     "paydown_ratio",        # avg_pay / limit_bal — payments as fraction of limit
-    "payment_trend",        # (latest_pay - prior_avg_pay) / (prior_avg_pay+1) — improving?
+    "payment_trend",        # (latest_pay - prior_avg_pay) / (|prior_avg_pay| + 1) — improving?
     "pay_status_current",
     "pay_status_avg",
     "pay_status_ema",
     "pay_is_delinquent",
     "pay_severity",
-    "MONTHS",
 ]
+
+# Human-readable names for charts and the app.
+FEATURE_LABELS: Dict[str, str] = {
+    "LIMIT_BAL":          "Credit Limit",
+    "AGE":                "Age",
+    "EDUCATION":          "Education",
+    "MARRIAGE":           "Marital Status",
+    "avg_pay_amt":        "Avg Monthly Payment",
+    "avg_bill_amt":       "Avg Monthly Bill",
+    "credit_utilization": "Credit Utilization",
+    "repay_ratio_avg":    "Payment Coverage",
+    "cur_recent":         "Latest Pay Coverage",
+    "paydown_ratio":      "Paydown Rate",
+    "payment_trend":      "Payment Trend",
+    "pay_status_current": "Pay Status (Current)",
+    "pay_status_avg":     "Pay Status (Avg)",
+    "pay_status_ema":     "Pay Status (EMA)",
+    "pay_is_delinquent":  "Delinquent",
+    "pay_severity":       "Delinquency Severity",
+}
+
+# Highest PAY code in the source data ("8 months or more late").
+MAX_PAY_CODE = 8.0
 
 
 # ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
-def _to_num(s: pd.Series | float | int, default: float = 0.0) -> pd.Series:
-    if isinstance(s, (int, float, np.number)):
-        return pd.Series([s], dtype=float)
-    return pd.to_numeric(s, errors="coerce").fillna(default).astype(float)
+def _col(df: pd.DataFrame, name: str, default: float = 0.0) -> pd.Series:
+    """Numeric column aligned to df.index; missing column or NaN -> default."""
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce").astype(float).fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
 
 
-def alpha_from_halflife(halflife: int = 3) -> float:
+def alpha_from_halflife(halflife: int = HALFLIFE_DEFAULT) -> float:
     h = max(1, int(halflife))
     return 1.0 - 2.0 ** (-1.0 / h)
 
 
-def update_avg_vec(prior: pd.Series | float,
-                   latest: pd.Series | float,
-                   months_total: pd.Series | int) -> pd.Series:
-    """Running average update: new_avg = (prior*(n-1) + latest) / n"""
-    prior = _to_num(prior, 0.0)
-    latest = _to_num(latest, 0.0)
-
-    if isinstance(months_total, (int, float, np.number)):
-        months = pd.Series([months_total] * max(len(prior), len(latest)))
-    else:
-        months = pd.to_numeric(months_total, errors="coerce").fillna(1).astype(int)
-    months = months.clip(lower=1)
-
-    return (prior * (months - 1) + latest) / months
+def update_avg_vec(prior: pd.Series, latest: pd.Series, months_total: pd.Series) -> pd.Series:
+    """Running average update: new_avg = (prior*(n-1) + latest) / n, with n >= 1."""
+    n = months_total.clip(lower=1)
+    return (prior * (n - 1) + latest) / n
 
 
-def _clip01(s: pd.Series | float) -> pd.Series:
-    if isinstance(s, (int, float, np.number)):
-        return pd.Series([float(np.clip(s, 0.0, 1.0))])
-    return s.clip(0.0, 1.0)
+def _coverage(paid: pd.Series, owed: pd.Series) -> pd.Series:
+    """paid / owed in [0, 1]. Nothing owed (zero or credit balance) counts as fully covered."""
+    ratio = paid / owed.where(owed > 0)
+    return ratio.clip(0.0, 1.0).fillna(1.0)
 
 
-def _compute_ratios(
-    limit_bal: pd.Series,
-    avg_pay_amt: pd.Series,
-    avg_bill_amt: pd.Series,
-    latest_pay_amt: pd.Series,
-    latest_bill_amt: pd.Series,
-    avg_pay_amt_prior: pd.Series,
-) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
-    denom_avg_bill = avg_bill_amt.replace(0, np.nan)
-    denom_limit = limit_bal.replace(0, np.nan)
-    denom_latest_bill = latest_bill_amt.replace(0, np.nan)
-    denom_prior = (avg_pay_amt_prior.abs() + 1.0)  # +1 avoids div-by-zero
-
-    repay_ratio_avg  = _clip01(avg_pay_amt / denom_avg_bill).fillna(0.0)
-    cur_recent       = _clip01(latest_pay_amt / denom_latest_bill).fillna(0.0)
-    paydown_ratio    = _clip01(avg_pay_amt / denom_limit).fillna(0.0)
-    credit_utilization = _clip01(avg_bill_amt / denom_limit).fillna(0.0)
-    payment_trend    = ((avg_pay_amt - avg_pay_amt_prior) / denom_prior).clip(-1.0, 1.0).fillna(0.0)
-
-    return repay_ratio_avg, cur_recent, paydown_ratio, credit_utilization, payment_trend
+def _share_of_limit(amount: pd.Series, limit_bal: pd.Series) -> pd.Series:
+    return (amount / limit_bal.where(limit_bal > 0)).clip(0.0, 1.0).fillna(0.0)
 
 
 # ---------------------------------------------------------------------
@@ -99,173 +100,94 @@ def _compute_ratios(
 # ---------------------------------------------------------------------
 def compute_features(
     df: pd.DataFrame,
-    months_default: int = 6,
-    halflife: int = 3,
+    months_default: int = MONTHS_DEFAULT,
+    halflife: int = HALFLIFE_DEFAULT,
     feature_order: Iterable[str] = FEATURE_COLUMNS_DEFAULT,
-    write_schema_to: str | Path | None = "models/feature_columns.txt",
+    write_schema_to: str | Path | None = None,
 ) -> pd.DataFrame:
-    df = df.copy()
+    """
+    Build model features from the minimal inputs (see MINIMAL_INPUT_KEYS).
+    The *_PRIOR / PRIOR_* inputs are averages over the months *before* the
+    latest one; MONTHS (optional column) is the history length including the
+    latest month.
+    """
+    months = _col(df, "MONTHS", months_default)
+    months = months.where(months >= 1, months_default)
 
-    if "MONTHS" in df.columns:
-        months_total = pd.to_numeric(df["MONTHS"], errors="coerce").fillna(months_default).astype(int)
-    else:
-        months_total = pd.Series(months_default, index=df.index, dtype=int)
+    limit_bal = _col(df, "LIMIT_BAL")
+    pay_latest = _col(df, "PAY_AMT_LATEST")
+    bill_latest = _col(df, "BILL_AMT_LATEST")
+    pay_prior = _col(df, "AVG_PAY_AMT_PRIOR")
+    bill_prior = _col(df, "AVG_BILL_AMT_PRIOR")
+    status = _col(df, "PAY_STATUS")
+    status_prior = _col(df, "PRIOR_PAY_AVG", np.nan).fillna(status)
 
-    avg_pay_amt_prior = _to_num(df.get("AVG_PAY_AMT_PRIOR", 0.0), 0.0)
-    if len(avg_pay_amt_prior) == 1 and len(df) > 1:
-        avg_pay_amt_prior = pd.Series(avg_pay_amt_prior.iloc[0], index=df.index)
+    feats = pd.DataFrame(index=df.index)
+    feats["LIMIT_BAL"] = limit_bal
+    feats["AGE"] = _col(df, "AGE")
+    feats["EDUCATION"] = _col(df, "EDUCATION")
+    feats["MARRIAGE"] = _col(df, "MARRIAGE")
 
-    df["avg_pay_amt"] = update_avg_vec(df.get("AVG_PAY_AMT_PRIOR", 0.0),
-                                       df.get("PAY_AMT_LATEST", 0.0),
-                                       months_total)
+    feats["avg_pay_amt"] = update_avg_vec(pay_prior, pay_latest, months)
+    feats["avg_bill_amt"] = update_avg_vec(bill_prior, bill_latest, months)
 
-    df["avg_bill_amt"] = update_avg_vec(df.get("AVG_BILL_AMT_PRIOR", 0.0),
-                                        df.get("BILL_AMT_LATEST", 0.0),
-                                        months_total)
-
-    df["pay_status_current"] = _to_num(df.get("PAY_STATUS", 0.0), 0.0)
-
-    df["pay_status_avg"] = update_avg_vec(df.get("PRIOR_PAY_AVG", 0.0),
-                                          df["pay_status_current"],
-                                          months_total)
+    feats["credit_utilization"] = _share_of_limit(feats["avg_bill_amt"], limit_bal)
+    feats["repay_ratio_avg"] = _coverage(feats["avg_pay_amt"], feats["avg_bill_amt"])
+    feats["cur_recent"] = _coverage(pay_latest, bill_latest)
+    feats["paydown_ratio"] = _share_of_limit(feats["avg_pay_amt"], limit_bal)
+    feats["payment_trend"] = ((pay_latest - pay_prior) / (pay_prior.abs() + 1.0)).clip(-1.0, 1.0)
 
     a = alpha_from_halflife(halflife)
-    prior_for_ema = _to_num(df.get("PRIOR_PAY_AVG", np.nan)).fillna(df["pay_status_current"])
-    df["pay_status_ema"] = a * df["pay_status_current"] + (1 - a) * prior_for_ema
+    feats["pay_status_current"] = status
+    feats["pay_status_avg"] = update_avg_vec(status_prior, status, months)
+    feats["pay_status_ema"] = a * status + (1 - a) * status_prior
+    feats["pay_is_delinquent"] = (status > 0).astype(int)
+    feats["pay_severity"] = status.clip(lower=0.0) / MAX_PAY_CODE
 
-    df["pay_is_delinquent"] = (df["pay_status_current"] > 0).astype(int)
-    df["pay_severity"] = np.maximum(0.0, df["pay_status_current"].astype(float)) / 8.0
-
-    limit_bal = _to_num(df.get("LIMIT_BAL", 0.0), 0.0)
-    if len(limit_bal) == 1 and len(df) > 1:
-        limit_bal = pd.Series(limit_bal.iloc[0], index=df.index)
-
-    avg_pay_prior_series = pd.Series(
-        pd.to_numeric(df.get("AVG_PAY_AMT_PRIOR", pd.Series(0.0, index=df.index)),
-                      errors="coerce").fillna(0.0).values,
-        index=df.index,
-    )
-
-    repay_ratio_avg, cur_recent, paydown_ratio, credit_utilization, payment_trend = _compute_ratios(
-        limit_bal=pd.Series(limit_bal.values, index=df.index),
-        avg_pay_amt=df["avg_pay_amt"],
-        avg_bill_amt=df["avg_bill_amt"],
-        latest_pay_amt=pd.Series(_to_num(df.get("PAY_AMT_LATEST", 0.0), 0.0).values, index=df.index),
-        latest_bill_amt=pd.Series(_to_num(df.get("BILL_AMT_LATEST", 0.0), 0.0).values, index=df.index),
-        avg_pay_amt_prior=avg_pay_prior_series,
-    )
-    df["repay_ratio_avg"]    = repay_ratio_avg
-    df["cur_recent"]         = cur_recent
-    df["paydown_ratio"]      = paydown_ratio
-    df["credit_utilization"] = credit_utilization
-    df["payment_trend"]      = payment_trend
-
-    df["MONTHS"] = months_total
-
-    feature_order = list(feature_order)
-    exist = [c for c in feature_order if c in df.columns]
-    out = df.loc[:, exist].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    order = [c for c in feature_order if c in feats.columns]
+    missing = [c for c in feature_order if c not in feats.columns]
+    if missing:
+        raise ValueError(f"Unknown feature(s) requested: {missing}")
+    out = feats.loc[:, order].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     if write_schema_to:
-        Path(write_schema_to).parent.mkdir(parents=True, exist_ok=True)
-        with open(write_schema_to, "w") as f:
-            for c in exist:
-                f.write(c + "\n")
-
+        write_feature_schema(order, write_schema_to)
     return out
 
 
 # ---------------------------------------------------------------------
 # Single-row builder (for Streamlit form)
 # ---------------------------------------------------------------------
+UI_KEYS = [
+    "avg_pay_amt", "avg_bill_amt", "credit_utilization", "repay_ratio_avg",
+    "cur_recent", "paydown_ratio", "payment_trend",
+    "pay_status_current", "pay_status_avg", "pay_status_ema",
+]
+
+
 def build_single_from_minimal(
     row_dict: Dict[str, float | int | str],
-    months: int = 6,
-    halflife: int = 3,
+    months: int = MONTHS_DEFAULT,
+    halflife: int = HALFLIFE_DEFAULT,
     feature_order: Iterable[str] = FEATURE_COLUMNS_DEFAULT,
 ) -> Tuple[pd.Series, Dict[str, float]]:
-    s = pd.Series(row_dict, dtype="object")
-
-    months_total = int(s.get("MONTHS", months)) if pd.notna(s.get("MONTHS", np.nan)) else months
-
-    avg_pay_amt_prior_val = float(pd.to_numeric(pd.Series([s.get("AVG_PAY_AMT_PRIOR", 0.0)]), errors="coerce").fillna(0.0)[0])
-
-    avg_pay_amt = update_avg_vec(pd.Series([avg_pay_amt_prior_val]),
-                                 pd.Series([s.get("PAY_AMT_LATEST", 0.0)]),
-                                 pd.Series([months_total]))[0]
-
-    avg_bill_amt = update_avg_vec(pd.Series([s.get("AVG_BILL_AMT_PRIOR", 0.0)]),
-                                  pd.Series([s.get("BILL_AMT_LATEST", 0.0)]),
-                                  pd.Series([months_total]))[0]
-
-    pay_status_current = float(pd.to_numeric(pd.Series([s.get("PAY_STATUS", 0.0)]), errors="coerce").fillna(0.0)[0])
-    prior_pay_avg = float(pd.to_numeric(pd.Series([s.get("PRIOR_PAY_AVG", 0.0)]), errors="coerce").fillna(0.0)[0])
-
-    pay_status_avg = update_avg_vec(pd.Series([prior_pay_avg]),
-                                    pd.Series([pay_status_current]),
-                                    pd.Series([months_total]))[0]
-
-    a = alpha_from_halflife(halflife)
-    pay_status_ema = a * pay_status_current + (1 - a) * prior_pay_avg
-
-    pay_is_delinquent = int(pay_status_current > 0)
-    pay_severity = max(0.0, pay_status_current) / 8.0
-
-    limit_bal = float(pd.to_numeric(pd.Series([s.get("LIMIT_BAL", 0.0)]), errors="coerce").fillna(0.0)[0])
-    latest_pay = float(pd.to_numeric(pd.Series([s.get("PAY_AMT_LATEST", 0.0)]), errors="coerce").fillna(0.0)[0])
-    latest_bill = float(pd.to_numeric(pd.Series([s.get("BILL_AMT_LATEST", 0.0)]), errors="coerce").fillna(0.0)[0])
-
-    repay_ratio_avg, cur_recent, paydown_ratio, credit_utilization, payment_trend = _compute_ratios(
-        limit_bal=pd.Series([limit_bal]),
-        avg_pay_amt=pd.Series([float(avg_pay_amt)]),
-        avg_bill_amt=pd.Series([float(avg_bill_amt)]),
-        latest_pay_amt=pd.Series([latest_pay]),
-        latest_bill_amt=pd.Series([latest_bill]),
-        avg_pay_amt_prior=pd.Series([avg_pay_amt_prior_val]),
-    )
-
-    feat = {
-        "LIMIT_BAL": float(limit_bal),
-        "AGE": float(pd.to_numeric(pd.Series([s.get("AGE", 0.0)]), errors="coerce").fillna(0.0)[0]),
-        "EDUCATION": float(pd.to_numeric(pd.Series([s.get("EDUCATION", 0.0)]), errors="coerce").fillna(0.0)[0]),
-        "MARRIAGE": float(pd.to_numeric(pd.Series([s.get("MARRIAGE", 0.0)]), errors="coerce").fillna(0.0)[0]),
-        "avg_pay_amt": float(avg_pay_amt),
-        "avg_bill_amt": float(avg_bill_amt),
-        "credit_utilization": float(credit_utilization.iloc[0]),
-        "repay_ratio_avg": float(repay_ratio_avg.iloc[0]),
-        "cur_recent": float(cur_recent.iloc[0]),
-        "paydown_ratio": float(paydown_ratio.iloc[0]),
-        "payment_trend": float(payment_trend.iloc[0]),
-        "pay_status_current": pay_status_current,
-        "pay_status_avg": float(pay_status_avg),
-        "pay_status_ema": float(pay_status_ema),
-        "pay_is_delinquent": pay_is_delinquent,
-        "pay_severity": float(pay_severity),
-        "MONTHS": float(months_total),
-    }
-
-    order = [c for c in feature_order if c in feat]
-    feature_row = pd.Series({c: feat[c] for c in order}, index=order, dtype=float)
-
-    ui = {
-        "avg_pay_amt": float(avg_pay_amt),
-        "avg_bill_amt": float(avg_bill_amt),
-        "credit_utilization": float(credit_utilization.iloc[0]),
-        "repay_ratio_avg": float(repay_ratio_avg.iloc[0]),
-        "cur_recent": float(cur_recent.iloc[0]),
-        "paydown_ratio": float(paydown_ratio.iloc[0]),
-        "payment_trend": float(payment_trend.iloc[0]),
-        "pay_status_current": pay_status_current,
-        "pay_status_avg": float(pay_status_avg),
-        "pay_status_ema": float(pay_status_ema),
-    }
+    """Same code path as compute_features, so app and training can't drift apart."""
+    all_feats = compute_features(
+        pd.DataFrame([row_dict]), months_default=months, halflife=halflife,
+        feature_order=FEATURE_COLUMNS_DEFAULT,
+    ).iloc[0].astype(float)
+    order = list(feature_order)
+    feature_row = all_feats.reindex(order)
+    if feature_row.isna().any():
+        raise ValueError(f"Schema asks for unknown features: {list(feature_row[feature_row.isna()].index)}")
+    ui = {k: float(all_feats[k]) for k in UI_KEYS}
     return feature_row, ui
 
 
 # ---------------------------------------------------------------------
 # Helper: split X/y and save schema
 # ---------------------------------------------------------------------
-def split_xy(features_df: pd.DataFrame, target_col: str = "DEFAULT") -> Tuple[pd.DataFrame, pd.Series]:
+def split_xy(features_df: pd.DataFrame, target_col: str = "DEFAULT") -> Tuple[pd.DataFrame, Optional[pd.Series]]:
     if target_col in features_df.columns:
         y = features_df[target_col].astype(int)
         X = features_df.drop(columns=[target_col])
@@ -281,6 +203,56 @@ def write_feature_schema(feature_cols: Iterable[str], path: str | Path = "models
             f.write(str(c) + "\n")
 
 
+def read_feature_schema(path: str | Path = "models/feature_columns.txt") -> Optional[List[str]]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    cols = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+    return cols or None
+
+
+def featurize_table(
+    df: pd.DataFrame,
+    months: int = MONTHS_DEFAULT,
+    halflife: int = HALFLIFE_DEFAULT,
+    target_col: str = "DEFAULT",
+) -> Tuple[pd.DataFrame, Optional[pd.Series]]:
+    """
+    Raw minimal table (or already-engineered table) -> (X, y).
+    y is None when the target column is absent.
+    """
+    y = None
+    if target_col in df.columns:
+        y = pd.to_numeric(df[target_col], errors="coerce")
+        if y.isna().any():
+            raise ValueError(f"{int(y.isna().sum())} rows have a missing/non-numeric '{target_col}'.")
+        y = y.astype(int)
+    X = df.drop(columns=[target_col], errors="ignore")
+    if not set(FEATURE_COLUMNS_DEFAULT).issubset(X.columns):
+        X = compute_features(X, months_default=months, halflife=halflife)
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return X, y
+
+
+def align_to_schema(X: pd.DataFrame, schema: Iterable[str]) -> pd.DataFrame:
+    schema = list(schema)
+    missing = [c for c in schema if c not in X.columns]
+    if missing:
+        raise ValueError(f"Missing required feature columns: {missing}")
+    return X.loc[:, schema]
+
+
+def read_table(path: str | Path) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input not found: {path}")
+    if path.suffix.lower() in (".parquet", ".pq"):
+        return pd.read_parquet(path)
+    if path.suffix.lower() in (".csv", ".txt"):
+        return pd.read_csv(path)
+    raise ValueError(f"Unsupported file type: {path.suffix}")
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -288,15 +260,20 @@ def _cli():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=Path("data/features.parquet"))
-    ap.add_argument("--months", type=int, default=6)
-    ap.add_argument("--halflife", type=int, default=3)
+    ap.add_argument("--months", type=int, default=MONTHS_DEFAULT)
+    ap.add_argument("--halflife", type=int, default=HALFLIFE_DEFAULT)
     args = ap.parse_args()
 
-    df = pd.read_csv(args.input)
-    feats = compute_features(df, months_default=args.months, halflife=args.halflife)
+    df = read_table(args.input)
+    X, y = featurize_table(df, months=args.months, halflife=args.halflife)
+    if y is not None:
+        X = X.assign(DEFAULT=y.values)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    feats.to_parquet(args.out, index=False)
-    print(f"Saved features to {args.out} with shape {feats.shape}")
+    if args.out.suffix.lower() in (".parquet", ".pq"):
+        X.to_parquet(args.out, index=False)
+    else:
+        X.to_csv(args.out, index=False)
+    print(f"Saved features to {args.out} with shape {X.shape}")
 
 
 if __name__ == "__main__":

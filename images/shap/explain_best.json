@@ -1,6 +1,6 @@
 {
   "model": "best",
-  "n_rows": 29163,
+  "n_rows": 30000,
   "n_features": 16,
   "bg_size": 512,
   "force_n": 10,
@@ -12,9 +12,9 @@
     "MARRIAGE",
     "avg_pay_amt",
     "avg_bill_amt",
+    "credit_utilization",
     "repay_ratio_avg",
     "cur_recent",
-    "paydown_ratio",
-    "mpr"
+    "paydown_ratio"
   ]
 }
